@@ -1,6 +1,7 @@
 use std::future::Future;
 
 pub mod amo;
+pub mod pb;
 
 pub async fn subscribe<K, M, F>(create_task: impl FnMut(Source<M>) -> F)
 where
@@ -56,3 +57,10 @@ impl App {
         Res
     }
 }
+
+pub struct Invoke;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Addr;
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Id;

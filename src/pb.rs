@@ -1,7 +1,7 @@
 use crate::{join, publish, serve, subscribe, Addr, App, Handle, Id, Invoke, Op, Res, Source};
 
 pub mod messages {
-    use crate::{Addr, Op, Res};
+    use crate::{Addr, Id, Op, Res};
 
     #[derive(Debug, Clone)]
     pub struct Request {
@@ -15,11 +15,26 @@ pub mod messages {
         pub seq: u32,
         pub result: Res,
     }
+
+    #[derive(Debug, Clone)]
+    pub struct View {
+        pub seq: u32,
+        pub primary_id: Id,
+        pub backup_id: Id,
+    }
+}
+
+#[derive(Debug)]
+pub struct Query;
+
+pub async fn view_server_task() {
+    //
 }
 
 pub async fn client_task(id: Id, addr: Addr) {
     subscribe::<Addr, messages::Reply, _>(move |source| {
         struct ServeTask {
+            server_id: Id,
             seq: u32,
             source: Source<messages::Reply>,
             id: Id,
@@ -33,7 +48,8 @@ pub async fn client_task(id: Id, addr: Addr) {
                     op: request,
                     client_addr: self.addr,
                 };
-                publish(self.id, request);
+                publish((self.server_id, self.id), request);
+                // TODO timeout & query view
                 while let Some(reply) = self.source.recv().await {
                     if reply.seq != self.seq {
                         continue;
@@ -43,17 +59,24 @@ pub async fn client_task(id: Id, addr: Addr) {
                 unreachable!()
             }
         }
-        serve::<Invoke, Op, _>(ServeTask {
-            seq: 0,
-            source,
-            id,
-            addr,
-        })
+        async move {
+            let server_id = crate::request::<_, _, messages::View>(Query, ())
+                .await
+                .primary_id;
+            serve::<Invoke, Op, _>(ServeTask {
+                seq: 0,
+                source,
+                id,
+                addr,
+                server_id,
+            })
+            .await
+        }
     })
     .await;
 }
 
-pub async fn server_task(app: App) {
+pub async fn server_task(app: App, id: Id) {
     struct Execute;
 
     let reply_tasks = subscribe::<Id, messages::Request, _>(|mut source| {
@@ -79,14 +102,16 @@ pub async fn server_task(app: App) {
         }
     });
 
-    struct ExecuteTask(App);
-    impl Handle<Op, Res> for ExecuteTask {
-        async fn handle(&mut self, request: Op) -> Res {
-            let Self(app) = self;
-            app.execute(request)
-        }
-    }
-    let execute_task = serve::<Execute, Op, _>(ExecuteTask(app));
+    struct NewView;
 
-    join(reply_tasks, execute_task).await;
+    let sync_task = subscribe::<NewView, messages::View, _>(|mut source| async move {
+        while let Some(view) = source.recv().await {
+            if view.primary_id != id && view.backup_id != id {
+                continue;
+            }
+            if view.backup_id == id {
+                
+            }
+        }
+    });
 }
