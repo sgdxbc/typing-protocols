@@ -1,11 +1,13 @@
 pub mod amo;
+#[allow(unused)]
+pub mod pb;
 
 #[derive(Debug, Clone)]
 pub struct Op;
 #[derive(Debug, Clone)]
 pub struct Res;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct App;
 
 impl App {
