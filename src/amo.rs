@@ -51,8 +51,9 @@ mod typed {
         //   Clean->Dirty->InFlight->Clean)
         // * what side effect can/has to be made during transition (similar to InFlight->Clean must
         //   go through a blocking hardware-synchronized `fence()`)
-        //   in the ideal cases this builds a bijection between transition and side effects
-        //   + if a Replied -> WaitingReply, a `send_to_server(...)` must be issued
+        //   in the ideal cases this builds a bidirectional mapping between transition and side 
+        //   effects
+        //   + if a Replied->WaitingReply happens, a `send_to_server(...)` must be issued
         //   + `send_to_server(...)` is only issued in Replied->WaitingReply and
         //     WaitingReply->WaitingReply transitions
         //   so both direction of reasoning can be benefitted

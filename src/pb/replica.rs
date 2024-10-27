@@ -5,7 +5,7 @@ use crate::{Addr, App, Id, Op};
 pub mod messages {
     use std::collections::BTreeMap;
 
-    use crate::{App, Id};
+    use crate::{App, Id, Op};
 
     pub use crate::pb::messages::*;
 
@@ -14,14 +14,15 @@ pub mod messages {
     // instead the methods of `Context` are used, and these messages are only prepared for
     // deployment
     #[derive(Debug, Clone)]
-    pub struct SyncRequest {
-        pub seq: u32,
-        pub request: Request,
+    pub struct SyncOp {
+        pub sync_seq: u32,
+        pub client_id: Id,
+        pub op: Op,
     }
 
     #[derive(Debug, Clone)]
     pub struct SyncOkUpTo {
-        pub seq: u32,
+        pub sync_seq: u32,
     }
 
     #[derive(Debug, Clone)]
@@ -54,33 +55,31 @@ mod typed {
     // effect (i.e. no `sync_op` call), and BackingUp->Replying (i.e. execution) happens immediately
     // after it
     //
-    // backup state machine: start Replied(0)
-    // Replied(seq)->Replying(seq')->Replied(seq')
+    // backup state machine: start BackingUp(seq) (constructible from SyncOp)
+    // BackingUp(seq)->Replying(seq)
     //
-    // the two machines disagree on permitted transitions, so two sets of states are instantiated
-    // to be specific, PReplied->Replying is not permitted while BReplied->Replying is permitted
-    // consequentially, PReplying and BReplying must also be distinguished because
-    // PReplying->PReplied while BReplying->BReplied
+    // although both machines have BackingUp and Replying states (and the transition in between),
+    // PReplying and BReplying should be distinguished because PReplying further permits further
+    // transition to Replied while BReplying does not, while BReplying is directly constructible but
+    // PReplying is not. consequentially PBackingUp and BBackingUp
+    // also need to be distinguished because they transition to different states
 
     // primary
     #[derive(Debug, Clone)]
     pub struct PReplied(u32);
 
     #[derive(Debug, Clone)]
-    pub struct BackingUp(u32, pub Op, pub Addr);
+    pub struct PBackingUp(u32, pub Op, pub Addr);
 
-    pub struct PReplying(Replying);
+    #[derive(Debug, Clone)]
+    pub struct PReplying(u32, pub Res);
 
     // backup
     #[derive(Debug, Clone)]
-    pub struct BReplied(u32);
+    pub struct BBackingUp(u32, pub Op);
 
     #[derive(Debug, Clone)]
-    pub struct BReplying(Replying);
-
-    // shared
-    #[derive(Debug, Clone)]
-    pub struct Replying(u32, pub Res);
+    pub struct BReplying(u32, pub Res);
 
     impl PReplied {
         pub fn new() -> Self {
@@ -93,17 +92,17 @@ mod typed {
             sync_seq: u32,
             backup_id: Id,
             context: &mut impl super::Context,
-        ) -> BackingUp {
+        ) -> PBackingUp {
             context.sync_op(backup_id, sync_seq, request.id, request.op.clone());
-            BackingUp(request.seq, request.op, request.client_addr)
+            PBackingUp(request.seq, request.op, request.client_addr)
         }
 
-        pub fn request_no_sync(self, request: messages::Request) -> BackingUp {
-            BackingUp(request.seq, request.op, request.client_addr)
+        pub fn request_no_sync(self, request: messages::Request) -> PBackingUp {
+            PBackingUp(request.seq, request.op, request.client_addr)
         }
     }
 
-    impl BackingUp {
+    impl PBackingUp {
         pub fn execute(self, app: &mut App, context: &mut impl super::Context) -> PReplying {
             let Self(seq, op, addr) = self;
             let result = app.execute(op);
@@ -112,21 +111,23 @@ mod typed {
                 result: result.clone(),
             };
             context.send_reply(addr, reply);
-            PReplying(Replying(seq, result))
+            PReplying(seq, result)
         }
     }
 
-    impl BReplied {
-        pub fn new() -> Self {
-            Self(0)
+    impl BBackingUp {
+        pub fn new(seq: u32, op: Op) -> Self {
+            Self(seq, op)
         }
 
-        pub fn execute(self, seq: u32, op: Op, app: &mut App) -> BReplying {
-            BReplying(Replying(seq, app.execute(op)))
+        // unlike PBackingUp, no side effect is made to the context on backup server
+        pub fn execute(self, app: &mut App) -> BReplying {
+            let Self(seq, op) = self;
+            BReplying(seq, app.execute(op))
         }
     }
 
-    impl Replying {
+    impl PReplying {
         pub fn reply(self, addr: Addr, context: &mut impl super::Context) -> Self {
             let Self(seq, result) = self;
             let reply = messages::Reply {
@@ -134,7 +135,7 @@ mod typed {
                 result: result.clone(),
             };
             context.send_reply(addr, reply);
-            Replying(seq, result)
+            PReplying(seq, result)
         }
 
         // utilities
@@ -147,90 +148,42 @@ mod typed {
         }
     }
 
-    impl PReplying {
-        pub fn received(self) -> PReplied {
-            PReplied(self.0 .0)
-        }
-
-        pub fn reply(self, addr: Addr, context: &mut impl super::Context) -> Self {
-            Self(self.0.reply(addr, context))
-        }
-    }
-
-    impl Deref for PReplying {
-        type Target = Replying;
-
-        fn deref(&self) -> &Self::Target {
-            &self.0
-        }
-    }
-
     impl BReplying {
-        pub fn received(self) -> BReplied {
-            BReplied(self.0 .0)
-        }
-
-        pub fn reply(self, addr: Addr, context: &mut impl super::Context) -> Self {
-            Self(self.0.reply(addr, context))
-        }
-
         pub fn promote(self) -> PReplying {
-            PReplying(self.0)
+            let Self(seq, result) = self;
+            PReplying(seq, result)
         }
     }
 
-    impl Deref for BReplying {
-        type Target = Replying;
+    // per server state machine i.e. the "role"
+    // TODO put `app` into relevant states?
 
-        fn deref(&self) -> &Self::Target {
-            &self.0
-        }
+    #[derive(Debug)]
+    pub struct Primary {
+        pub prepared_seq: u32,
+        pub committed_seq: u32,
+        pub backing_up: BTreeMap<u32, PBackingUp>,
+        pub replying: BTreeMap<Id, PReplying>,
     }
 
     #[derive(Debug)]
-    pub struct Primary;
-    // pub struct Primary {
-    //     pub prepared_seq: u32,
-    //     committed_seq: u32,
-    // }
+    pub struct Backup {
+        pub committed_seq: u32,
+        pub backing_up: BTreeMap<u32, BBackingUp>,
+        pub replying: BTreeMap<Id, BReplying>,
+    }
 
     #[derive(Debug)]
-    pub struct Backup;
-    // pub struct Backup(u32);
-
-    #[derive(Debug)]
-    pub struct Promoting(Id); // id of the new backup; save for resending
+    pub struct Promoting {
+        pub backup_id: Id, // id of the new backup; save for resending
+        pub replying: BTreeMap<Id, BReplying>,
+    }
 
     #[derive(Debug)]
     // no restriction on constructor; Idle happens to be a (and the only) valid initial state
     pub struct Idle;
 
-    impl Primary {
-        // pub fn prepare(self) -> Self {
-        //     Self {
-        //         prepared_seq: self.prepared_seq + 1,
-        //         committed_seq: self.committed_seq,
-        //     }
-        // }
-
-        // pub fn commit(self) -> Self {
-        //     Self {
-        //         prepared_seq: self.prepared_seq,
-        //         committed_seq: self.upcoming_commit(),
-        //     }
-        // }
-
-        // // util
-        // pub fn upcoming_commit(&self) -> u32 {
-        //     self.committed_seq + 1
-        // }
-    }
-
     impl Backup {
-        // pub fn commit(self) -> Self {
-        //     Self(self.upcoming_commit())
-        // }
-
         pub fn promote(
             self,
             backup_id: Id,
@@ -239,48 +192,66 @@ mod typed {
             context: &mut impl super::Context,
         ) -> Promoting {
             context.sync_app(backup_id, app, replying);
-            Promoting(backup_id)
+            Promoting {
+                backup_id,
+                replying: self.replying,
+            }
         }
 
         pub fn promote_no_sync(self) -> Primary {
-            Primary
-            // Primary {
-            //     prepared_seq: 0,
-            //     committed_seq: 0,
-            // }
+            Primary {
+                prepared_seq: 0,
+                committed_seq: 0,
+                backing_up: Default::default(),
+                replying: self
+                    .replying
+                    .into_iter()
+                    .map(|(id, state)| (id, state.promote()))
+                    .collect(),
+            }
         }
-
-        // util
-        // pub fn upcoming_commit(&self) -> u32 {
-        //     self.0 + 1
-        // }
     }
 
     // design note: sync seq is not "inherited" between consecutive primaries
     // it always resets to 0 after backup promotions
     impl Promoting {
         pub fn promoted(self) -> Primary {
-            Primary
-            // Primary {
-            //     prepared_seq: 0,
-            //     committed_seq: 0,
-            // }
+            Primary {
+                prepared_seq: 0,
+                committed_seq: 0,
+                backing_up: Default::default(),
+                replying: self
+                    .replying
+                    .into_iter()
+                    .map(|(id, state)| (id, state.promote()))
+                    .collect(),
+            }
         }
     }
 
     impl Idle {
+        // only on the first view
         pub fn start_primary(self) -> Primary {
-            Primary
-            // Primary {
-            //     prepared_seq: 0,
-            //     committed_seq: 0,
-            // }
+            Primary {
+                prepared_seq: 0,
+                committed_seq: 0,
+                backing_up: Default::default(),
+                replying: Default::default(),
+            }
         }
 
-        pub fn load(self, primary_id: Id, context: &mut impl super::Context) -> Backup {
+        pub fn load(
+            self,
+            replying: BTreeMap<Id, BReplying>,
+            primary_id: Id,
+            context: &mut impl super::Context,
+        ) -> Backup {
             context.sync_app_ok(primary_id);
-            Backup
-            // Backup(0)
+            Backup {
+                committed_seq: 0,
+                backing_up: Default::default(),
+                replying,
+            }
         }
     }
 }
@@ -295,5 +266,17 @@ enum RoleState {
 
 #[derive(Debug)]
 pub struct State {
+    id: Id,
     role: RoleState,
+    app: App,
+}
+
+impl State {
+    pub fn new(id: Id, app: App) -> Self {
+        Self {
+            id,
+            app,
+            role: RoleState::Idle(typed::Idle),
+        }
+    }
 }
